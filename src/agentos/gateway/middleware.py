@@ -138,6 +138,11 @@ class LoopbackOriginMiddleware(BaseHTTPMiddleware):
     def _is_ui_path(self, path: str) -> bool:
         if self._ui_prefix is None:
             return False
+        # The bootstrap endpoint is served under the UI prefix but is an RPC
+        # payload (it leaks the host config path and auth mode), not a served
+        # page — it must stay behind the origin guard like any other /api/*.
+        if path == f"{self._ui_prefix}/api/bootstrap":
+            return False
         # Exact shell ("/control") or anything under it ("/control/..."),
         # never a bare-prefix match that would swallow sibling routes.
         return path == self._ui_prefix or path.startswith(self._ui_prefix + "/")
