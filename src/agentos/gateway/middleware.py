@@ -270,8 +270,9 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         if request.method == "GET" and path == "/api/approvals":
             return await call_next(request)  # type: ignore[no-any-return]
 
-        client_ip = self._get_client_ip(request)
         now = time.time()
+        self._prune_windows(now)
+        client_ip = self._get_client_ip(request)
         window = self._config.rate_limit.window_seconds
         max_req = self._config.rate_limit.max_requests
 
@@ -286,13 +287,40 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         self._windows[client_ip].append(now)
         return await call_next(request)  # type: ignore[no-any-return]
 
+    # Cap the number of tracked client buckets. Without a bound, an attacker
+    # (or a botnet behind rotating IPs) grows _windows forever — a memory DoS
+    # on a long-lived gateway. 10k buckets is far above any legitimate LAN /
+    # small-team deployment while keeping memory bounded (~a few MB worst case).
+    _MAX_TRACKED_CLIENTS = 10_000
+
     def _get_client_ip(self, request: Request) -> str:
-        forwarded = request.headers.get("x-forwarded-for")
-        if forwarded:
-            return forwarded.split(",")[0].strip()
+        # X-Forwarded-For is client-controlled on a direct (non-proxied)
+        # connection: trusting it unconditionally lets any caller rotate the
+        # header and bypass the rate limit entirely. Only honor it when the
+        # immediate peer is the configured trusted proxy.
+        peer = request.client.host if request.client else ""
+        trusted_proxy = self._config.auth.trusted_proxy
+        if trusted_proxy and peer == trusted_proxy:
+            forwarded = request.headers.get("x-forwarded-for")
+            if forwarded:
+                return forwarded.split(",")[0].strip()
         if request.client:
             return request.client.host
         return "unknown"
+
+    def _prune_windows(self, now: float) -> None:
+        """Drop fully-expired buckets and bound the tracked-client count."""
+        window = self._config.rate_limit.window_seconds
+        expired = [ip for ip, ts in self._windows.items() if not ts or now - ts[-1] >= window]
+        for ip in expired:
+            self._windows.pop(ip, None)
+        if len(self._windows) > self._MAX_TRACKED_CLIENTS:
+            # Evict oldest-seen buckets first (LRU-ish) to stay under the cap.
+            by_last_seen = sorted(
+                self._windows.items(), key=lambda kv: kv[1][-1] if kv[1] else 0.0
+            )
+            for ip, _ in by_last_seen[: len(self._windows) - self._MAX_TRACKED_CLIENTS]:
+                self._windows.pop(ip, None)
 
 
 class ErrorHandlingMiddleware(BaseHTTPMiddleware):
