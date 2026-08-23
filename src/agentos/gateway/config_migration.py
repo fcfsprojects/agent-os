@@ -134,6 +134,19 @@ RETIRED_CHANNEL_TYPE_ALIASES: dict[str, str] = {
     "wecom": "wecom",
 }
 
+DEPRECATED_SUBAGENTS_FIELDS: frozenset[str] = frozenset(
+    {
+        # Auto-archive was never wired: SubagentRegistry.archive() has zero
+        # callers, so this key was a silent no-op. SubagentsGatewayConfig
+        # forbids extras, so an existing agentos.toml carrying it would fail
+        # validation at boot without this migration entry.
+        "subagents.archive_after_minutes",
+    }
+)
+DEPRECATED_SUBAGENTS_LEAVES: frozenset[str] = frozenset(
+    k.removeprefix("subagents.") for k in DEPRECATED_SUBAGENTS_FIELDS
+)
+
 DEPRECATED_AGENT_TOKEN_SAVING_FIELDS: frozenset[str] = frozenset(
     {
         "agent_token_saving.tool_result_compression_enabled",
@@ -527,6 +540,19 @@ def migrate_config_payload(data: dict[str, Any]) -> ConfigMigrationResult:
         if deprecated:
             builder.removed_fields.extend(sorted(deprecated))
             handle_deprecated_memory_fields(deprecated, "config_migration")
+
+    subagents_section = builder.payload.get("subagents")
+    if isinstance(subagents_section, dict):
+        deprecated_subagents: dict[str, object] = {}
+        for leaf in list(subagents_section):
+            if leaf in DEPRECATED_SUBAGENTS_LEAVES:
+                deprecated_subagents[f"subagents.{leaf}"] = subagents_section.pop(leaf)
+        if deprecated_subagents:
+            builder.removed_fields.extend(sorted(deprecated_subagents))
+            builder.warnings.append(
+                "subagents.archive_after_minutes was removed; no auto-archive timer "
+                "exists, so the key was a silent no-op"
+            )
 
     token_saving = builder.payload.get("agent_token_saving")
     if isinstance(token_saving, dict):

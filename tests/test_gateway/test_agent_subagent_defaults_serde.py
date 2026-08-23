@@ -51,7 +51,6 @@ def test_gateway_config_exposes_agents_defaults_and_subagents_subtree() -> None:
     assert isinstance(cfg.subagents, SubagentsGatewayConfig)
     assert cfg.subagents.enforce_disabled_agents is False
     assert cfg.subagents.subagent_reserved_slots == 2
-    assert cfg.subagents.archive_after_minutes == 60
 
 
 def test_gateway_config_accepts_explicit_subagent_defaults() -> None:
@@ -60,11 +59,9 @@ def test_gateway_config_accepts_explicit_subagent_defaults() -> None:
         subagents=SubagentsGatewayConfig(
             enforce_disabled_agents=True,
             subagent_reserved_slots=4,
-            archive_after_minutes=0,
         ),
     )
     assert cfg.agents_defaults.subagents is not None
     assert cfg.agents_defaults.subagents.model == "haiku"
     assert cfg.subagents.enforce_disabled_agents is True
     assert cfg.subagents.subagent_reserved_slots == 4
-    assert cfg.subagents.archive_after_minutes == 0

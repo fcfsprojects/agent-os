@@ -1757,10 +1757,6 @@ class SubagentsGatewayConfig(BaseModel):
     """Number of slots in ``task_runtime.max_concurrency`` reserved for
     non-subagent tasks so a fan-out parent never starves itself."""
 
-    archive_after_minutes: int = Field(default=60, ge=0)
-    """Minutes after a subagent session goes terminal before its transcript
-    is archived. ``0`` disables auto-archive."""
-
     prompt_compact: bool = False
     """When enabled, subagent bootstrap prompts keep only AGENTS.md and TOOLS.md."""
 
