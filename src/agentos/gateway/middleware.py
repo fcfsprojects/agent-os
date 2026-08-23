@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import time
 from collections import defaultdict
 from collections.abc import Callable
@@ -14,6 +15,8 @@ from starlette.types import ASGIApp
 
 from agentos.gateway.access import is_loopback_address
 from agentos.gateway.config import GatewayConfig
+
+log = logging.getLogger(__name__)
 
 # Endpoints that carry no credentials and expose no Control surface; exempt from
 # both token auth and the cross-origin guard. Kept module-level so the origin
@@ -296,14 +299,26 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
 
 
 class ErrorHandlingMiddleware(BaseHTTPMiddleware):
-    """Catch unhandled exceptions and return structured JSON errors."""
+    """Catch unhandled exceptions and return structured JSON errors.
+
+    Raw ``str(exc)`` can leak internal paths, SQL fragments, provider URLs,
+    and other host details to any client that can reach the gateway. Only
+    include the raw message when the gateway runs in debug mode; production
+    clients get a generic message while the full exception stays in the log.
+    """
+
+    def __init__(self, app: ASGIApp, debug: bool = False) -> None:
+        super().__init__(app)
+        self._debug = debug
 
     async def dispatch(self, request: Request, call_next: Callable) -> Response:
         try:
             return await call_next(request)  # type: ignore[no-any-return]
         except Exception as exc:
+            log.exception("unhandled gateway error on %s %s", request.method, request.url.path)
+            detail = str(exc) if self._debug else "internal server error"
             return JSONResponse(
-                {"error": str(exc), "code": "INTERNAL_ERROR"},
+                {"error": detail, "code": "INTERNAL_ERROR"},
                 status_code=500,
             )
 
