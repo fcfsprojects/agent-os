@@ -36,6 +36,26 @@ def test_web_chat_source_metadata_preserves_allowed_elevation_hint() -> None:
     assert source["elevated"] == "bypass"
 
 
+def test_chat_source_metadata_drops_non_elevated_hint() -> None:
+    """Non-elevated modes (``off``/``restricted``/arbitrary strings) must be stripped.
+
+    The elevation filter anchors on ``agentos.permissions.ELEVATED_PERMISSION_MODES``,
+    so the allowlist stays in lockstep with the rest of the permission posture.
+    """
+    for hint in ("off", "restricted", "turbo", ""):
+        source = chat_source_metadata(
+            caller_kind="web",
+            channel_kind="webchat",
+            channel_id="webchat:webchat:main",
+            sender_id="operator",
+            source_kind="webui",
+            source_name="WebChat",
+            elevated=hint,
+        )
+
+        assert "elevated" not in source
+
+
 def test_chat_send_request_preserves_message_attachments_and_intent() -> None:
     request = ChatSendRequest(
         session_key="webchat:main",

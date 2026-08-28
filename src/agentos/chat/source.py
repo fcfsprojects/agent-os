@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from agentos.permissions import ELEVATED_PERMISSION_MODES
+
 
 def chat_source_metadata(
     *,
@@ -23,6 +25,6 @@ def chat_source_metadata(
         "source_kind": source_kind,
         "source_name": source_name,
     }
-    if elevated in ("on", "bypass", "full"):
+    if elevated in ELEVATED_PERMISSION_MODES:
         source["elevated"] = elevated
     return source
