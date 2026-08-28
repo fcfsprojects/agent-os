@@ -41,6 +41,8 @@ root release README with task-oriented guides.
 ## Surfaces and Operations
 
 - [`channels.md`](channels.md) - supported messaging channels and setup flow.
+- [`channels/email.md`](channels/email.md) - Email channel: SMTP/SSL, IMAP IDLE,
+  and timeout guidance (operator guide for PR #523, `Refs #522`).
 - [`providers-and-models.md`](providers-and-models.md) - LLM provider catalog,
   model selection, and runtime-backed model inspection.
 - [`search.md`](search.md) - web search providers and query workflow.
