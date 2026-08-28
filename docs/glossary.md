@@ -59,6 +59,15 @@ stuffing every old transcript into the active prompt.
 
 Read: [`features/memory.md`](features/memory.md)
 
+## MCP Bridge
+
+A stdio server that exposes AgentOS session workflows over the Model Context
+Protocol so MCP-capable clients (such as other local AI tools) can call into
+AgentOS. It is an integration surface — separate from the Web UI, CLI, channels,
+and gateway control console.
+
+Read: [`mcp-server.md`](mcp-server.md)
+
 ## Permission Profile
 
 The chosen tool-access posture for a run, such as `restricted`, `on`, `bypass`,
