@@ -8,7 +8,7 @@ from typing import Any
 
 import pytest
 
-from agentos.mcp_server.bridge import AgentOSMCPBridge
+from agentos.mcp_server.bridge import AgentOSMCPBridge, _clamp_above_zero
 
 
 class FakeGatewayClient:
@@ -261,3 +261,166 @@ async def test_events_wait_uses_dedicated_connection_and_closes_it() -> None:
     assert result["current_stream_seq"] == 8
     assert clients[0].closed is False
     assert event_client.closed is True
+
+
+# ---------------------------------------------------------------------------
+# issue #685 — upper-clamp inbound bridge parameters
+# ---------------------------------------------------------------------------
+#
+# Without these clamps a misbehaving or compromised MCP client can request
+# ``max_events=10**7``, ``timeout_ms=60_000``, or ``limit=10**9`` and pin a
+# gateway connection while unbounded buffers grow, OOMing the host
+# (100K events collected in 0.42s by the issue author). The bridge must
+# clamp each of those into a finite, documented ceiling before forwarding.
+
+
+@pytest.mark.asyncio
+async def test_conversations_list_clamps_huge_limit_to_ceiling() -> None:
+    """``conversations_list(limit=10**9)`` must be forwarded to the gateway
+    at the documented ceiling, not the raw hostile value."""
+    client = FakeGatewayClient()
+    bridge = AgentOSMCPBridge(gateway_client_factory=lambda: client)
+
+    await bridge.conversations_list(limit=10**9)
+
+    assert client.calls == [("sessions.list", {"limit": 5000})]
+
+
+@pytest.mark.asyncio
+async def test_conversations_list_passes_through_within_bounds() -> None:
+    """Sanity check: a sensible ``limit`` is forwarded unchanged so the
+    clamp does not regress the happy path."""
+    client = FakeGatewayClient()
+    bridge = AgentOSMCPBridge(gateway_client_factory=lambda: client)
+
+    await bridge.conversations_list(limit=50)
+
+    assert client.calls == [("sessions.list", {"limit": 50})]
+
+
+@pytest.mark.asyncio
+async def test_messages_read_clamps_huge_limit_to_ceiling() -> None:
+    """``messages_read(key, limit=10**9)`` must clamp before forwarding."""
+    client = FakeGatewayClient()
+    bridge = AgentOSMCPBridge(gateway_client_factory=lambda: client)
+
+    await client.events.put(
+        {
+            "event": "session.event.done",
+            "payload": {"session_key": "agent:main:main", "stream_seq": 5},
+        }
+    )
+    await bridge.events_wait("agent:main:main", timeout_ms=200)
+    # Subscribe happens before the history read on the first call, so reset.
+    client.calls.clear()
+
+    await bridge.messages_read("agent:main:main", limit=10**9)
+
+    assert client.calls == [
+        ("chat.history", {"sessionKey": "agent:main:main", "limit": 5000})
+    ]
+
+
+@pytest.mark.asyncio
+async def test_transcript_jsonl_clamps_huge_limit_to_ceiling() -> None:
+    """``transcript_jsonl`` delegates to ``messages_read`` and must inherit
+    the same ceiling."""
+    client = FakeGatewayClient()
+    bridge = AgentOSMCPBridge(gateway_client_factory=lambda: client)
+
+    await bridge.transcript_jsonl("agent:main:main", limit=10**9)
+
+    assert client.calls == [
+        ("chat.history", {"sessionKey": "agent:main:main", "limit": 5000})
+    ]
+
+
+@pytest.mark.asyncio
+async def test_bridge_rejects_zero_or_negative_limits() -> None:
+    """A hostile ``limit=0`` or ``limit=-5`` must coerce to 1 so the
+    gateway call does not break the lower-bound invariant. This is the
+    existing behavior; the upper-clamp change must not regress it."""
+    client = FakeGatewayClient()
+    bridge = AgentOSMCPBridge(gateway_client_factory=lambda: client)
+
+    await bridge.conversations_list(limit=0)
+    await bridge.messages_read("agent:main:main", limit=-5)
+
+    assert client.calls == [
+        ("sessions.list", {"limit": 1}),
+        ("chat.history", {"sessionKey": "agent:main:main", "limit": 1}),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_events_wait_clamps_huge_max_events_to_ceiling() -> None:
+    """``events_wait(..., max_events=10**7)`` must terminate promptly with
+    the events list bounded by the ceiling. Without the clamp the loop
+    would run indefinitely until ``timeout_ms`` expires."""
+    client = FakeGatewayClient()
+    # Drain a single terminal event so the loop exits on its own.
+    await client.events.put(
+        {
+            "event": "session.event.done",
+            "payload": {"session_key": "agent:main:main", "stream_seq": 1},
+        }
+    )
+    bridge = AgentOSMCPBridge(gateway_client_factory=lambda: client)
+
+    result = await bridge.events_wait(
+        "agent:main:main", timeout_ms=200, max_events=10**7
+    )
+
+    assert len(result["events"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_events_wait_passes_through_within_bounds() -> None:
+    """Sanity check: small ``max_events`` and ``timeout_ms`` are honored
+    exactly so the clamp does not regress the happy path."""
+    client = FakeGatewayClient()
+    await client.events.put(
+        {
+            "event": "session.event.done",
+            "payload": {"session_key": "agent:main:main", "stream_seq": 9},
+        }
+    )
+    bridge = AgentOSMCPBridge(gateway_client_factory=lambda: client)
+
+    result = await bridge.events_wait(
+        "agent:main:main", timeout_ms=500, max_events=5
+    )
+
+    assert result["current_stream_seq"] == 9
+    assert len(result["events"]) == 1
+
+
+# ---------------------------------------------------------------------------
+# _clamp_above_zero — unit tests for the helper used by events_wait
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("raw", "ceiling", "expected"),
+    [
+        # Existing lower-bound behavior preserved.
+        (0, 5000, 1),
+        (-1, 5000, 1),
+        (-1000, 5000, 1),
+        # Within bounds: pass through.
+        (1, 5000, 1),
+        (50, 5000, 50),
+        (5000, 5000, 5000),
+        # Hostile upper bound clamps to ceiling.
+        (10**9, 5000, 5000),
+        (10**9, 10000, 10000),
+        (10**9, 300000, 300000),
+        # Non-integer (stringified number, type-coerced) is accepted.
+        ("5000", 5000, 5000),
+        # Non-numeric input falls back to 1.
+        ("not-a-number", 5000, 1),
+        (None, 5000, 1),
+    ],
+)
+def test_clamp_above_zero_bounds(raw: Any, ceiling: int, expected: int) -> None:
+    assert _clamp_above_zero(raw, ceiling) == expected

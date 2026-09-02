@@ -27,6 +27,32 @@ class GatewayClientLike(Protocol):
     async def recv_event(self, timeout: float | None = None) -> dict[str, Any]: ...
 
 
+# Upper bounds for inbound MCP-bridge parameters.
+#
+# Without these clamps, a misbehaving or compromised MCP client can request
+# ``max_events=10**7``, ``timeout_ms=60_000``, or ``limit=10**9`` and pin a
+# gateway connection while unbounded buffers grow, OOMing the host. See
+# issue #685.
+_MAX_EVENTS_CEILING = 10_000
+_TIMEOUT_MS_CEILING = 300_000  # 5 minutes
+_HISTORY_LIMIT_CEILING = 5_000
+
+
+def _clamp_above_zero(value: int, ceiling: int) -> int:
+    """Clamp ``value`` into ``[1, ceiling]`` so a hostile caller cannot
+    request a 0 or negative bound (existing lower-bound check) or an
+    arbitrarily large one (new upper-bound check)."""
+    try:
+        n = int(value)
+    except (TypeError, ValueError):
+        return 1
+    if n < 1:
+        return 1
+    if n > ceiling:
+        return ceiling
+    return n
+
+
 def _default_gateway_client() -> GatewayClientLike:
     from agentos.gateway_client import GatewayRPCClient
 
@@ -65,7 +91,12 @@ class AgentOSMCPBridge:
 
     async def conversations_list(self, limit: int = 50) -> dict[str, Any]:
         client = await self._ensure_client()
-        return await client.list_sessions(limit=limit)
+        # Issue #685: upper-clamp ``limit`` so a misbehaving client cannot
+        # request an arbitrarily large page and pin the gateway. The ceiling
+        # is shared with the other history-reading entry points below so the
+        # whole bridge has one bound to reason about.
+        safe_limit = _clamp_above_zero(limit, _HISTORY_LIMIT_CEILING)
+        return await client.list_sessions(limit=safe_limit)
 
     async def session_resolve(self, key: str) -> dict[str, Any]:
         client = await self._ensure_client()
@@ -73,7 +104,11 @@ class AgentOSMCPBridge:
 
     async def messages_read(self, key: str, limit: int = 1000) -> dict[str, Any]:
         client = await self._ensure_client()
-        return await client.session_history(key, limit=limit)
+        # Issue #685: upper-clamp ``limit`` before forwarding to
+        # ``session_history`` so the bridge cannot be coerced into a 10**9-row
+        # history query.
+        safe_limit = _clamp_above_zero(limit, _HISTORY_LIMIT_CEILING)
+        return await client.session_history(key, limit=safe_limit)
 
     async def messages_send(
         self,
@@ -131,8 +166,14 @@ class AgentOSMCPBridge:
             current_stream_seq = int(
                 subscription.get("current_stream_seq") or since_stream_seq or 0
             )
-            deadline = time.monotonic() + max(0, timeout_ms) / 1000
-            max_events = max(1, max_events)
+            # Issue #685: upper-clamp ``timeout_ms`` and ``max_events``. Without
+            # an upper bound, a hostile caller can request a 60s timeout and a
+            # 10**7 event budget, growing the events list to OOM the host in
+            # under a second (verified by the issue author at 100K events in
+            # 0.42s).
+            safe_timeout_ms = _clamp_above_zero(timeout_ms, _TIMEOUT_MS_CEILING)
+            deadline = time.monotonic() + safe_timeout_ms / 1000
+            max_events = _clamp_above_zero(max_events, _MAX_EVENTS_CEILING)
 
             while len(events) < max_events:
                 remaining = deadline - time.monotonic()
