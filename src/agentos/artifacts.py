@@ -347,6 +347,12 @@ class ArtifactStore:
 def _safe_filename(name: str) -> str:
     cleaned = Path(name).name.strip() or "artifact"
     cleaned = _UNSAFE_FILENAME_RE.sub("_", cleaned).strip()
+    # Reject directory leaves that survive Path(name).name (which leaves
+    # ".." unchanged). Without this guard the value reaches
+    # `_named_artifact_delivery_path` as a directory component and breaks
+    # hardlink_to/copy2. See issue #742.
+    if cleaned in (".", ".."):
+        return "artifact"
     return cleaned[:160] or "artifact"
 
 

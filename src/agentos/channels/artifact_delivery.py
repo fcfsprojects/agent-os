@@ -142,8 +142,16 @@ def can_deliver_channel_files(channel: Any) -> bool:
 
 @contextlib.contextmanager
 def _named_artifact_delivery_path(source: Path, filename: str) -> Iterator[Path]:
+    # Second-layer guard against unsafe leaves. `_safe_filename` in
+    # `agentos.artifacts` already normalizes empty/dot/parent-dir inputs at
+    # publication time across `publish_bytes`, `publish_file`, and
+    # `ArtifactRef.from_dict`. This check catches the helper when called
+    # directly (e.g. from tests or a future caller that bypasses the store).
+    leaf = Path(filename).name
+    if not leaf or leaf in (".", ".."):
+        raise ValueError(f"unsafe delivery leaf: {filename!r}")
     with tempfile.TemporaryDirectory(prefix="agentos-artifact-") as tmp_dir:
-        target = Path(tmp_dir) / Path(filename).name
+        target = Path(tmp_dir) / leaf
         try:
             target.hardlink_to(source)
         except OSError:

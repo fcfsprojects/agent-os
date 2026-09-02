@@ -555,3 +555,88 @@ async def test_discord_typing_targets_active_channel_before_default() -> None:
         "/channels/active-channel/typing",
         "/channels/default-channel/typing",
     ]
+
+
+@pytest.mark.parametrize("unsafe_leaf", ["", ".", "..", "/", "./", "../"])
+def test_named_artifact_delivery_path_rejects_unsafe_leaves(
+    tmp_path: Path, unsafe_leaf: str
+) -> None:
+    """Issue #742: ``_named_artifact_delivery_path`` is a private helper, but
+    every internal caller passes ``ArtifactRef.name`` which is already
+    sanitized through ``_safe_filename``. The second-layer guard turns a
+    silent directory mis-target into a loud ``ValueError`` if a future
+    caller bypasses the store.
+    """
+
+    from agentos.channels.artifact_delivery import _named_artifact_delivery_path
+
+    source = tmp_path / "source.bin"
+    source.write_bytes(b"x")
+
+    with pytest.raises(ValueError, match="unsafe delivery leaf"):
+        with _named_artifact_delivery_path(source, unsafe_leaf):
+            pass
+
+
+@pytest.mark.asyncio
+async def test_artifact_delivery_succeeds_with_dot_dot_filename(
+    tmp_path: Path,
+) -> None:
+    """End-to-end regression for #742.
+
+    Publishing with ``name=".."`` must (1) normalize the artifact name at the
+    store boundary and (2) deliver a real file path to ``send_file`` instead
+    of a directory pointing outside the temp staging area.
+    """
+
+    store = ArtifactStore(tmp_path)
+    ref = store.publish_bytes(
+        b"report bytes",
+        session_id="session-1",
+        session_key="agent:main:channel:session-1",
+        name="..",
+        mime="text/plain",
+        source="test",
+    )
+
+    assert ref.name == "artifact"
+
+    delivered_paths: list[str] = []
+
+    class FileChannel:
+        capability_profile = ChannelCapabilityProfile(
+            channel_type="files",
+            native_file_upload=True,
+            media=True,
+        )
+
+        async def send_file(self, channel_id: str, file_path: str) -> ChannelSendResult:
+            assert channel_id == "c1"
+            delivered_path = Path(file_path)
+            assert delivered_path.is_file(), (
+                f"send_file must receive a file path, got {delivered_path}"
+            )
+            assert delivered_path.read_bytes() == b"report bytes"
+            delivered_paths.append(str(delivered_path))
+            return ChannelSendResult.sent(
+                capability=ChannelCapabilities.NATIVE_FILE_UPLOAD,
+                target_id=channel_id,
+            )
+
+    msg = IncomingMessage(
+        sender_id="u1",
+        channel_id="c1",
+        content="",
+        metadata={"is_group": False},
+    )
+    config = SimpleNamespace(attachments=SimpleNamespace(media_root=str(tmp_path)))
+
+    undelivered = await deliver_artifacts_as_channel_files(
+        FileChannel(),
+        msg,
+        [ref.to_dict()],
+        config,
+    )
+
+    assert undelivered == []
+    assert len(delivered_paths) == 1

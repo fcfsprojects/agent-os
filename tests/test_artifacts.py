@@ -652,3 +652,43 @@ async def test_publish_artifact_tool_rejects_missing_workspace_and_escape(tmp_pa
             await publish_artifact(path="../outside.txt")
     finally:
         current_tool_context.reset(token)
+
+
+@pytest.mark.parametrize(
+    "unsafe_name",
+    ["..", "../", "./"],
+)
+def test_artifact_store_sanitizes_dot_and_parent_dir_filenames(
+    tmp_path: Path, unsafe_name: str
+) -> None:
+    """Issue #742: ``Path(name).name`` leaves ``..`` unchanged.
+
+    Without the second-layer guard in ``_safe_filename``, those inputs reach
+    ``_named_artifact_delivery_path`` as a directory component and break
+    ``hardlink_to`` / ``copy2``. The store must normalize them to the
+    default ``"artifact"`` leaf at the publication boundary.
+
+    Note: ``Path('../../etc/passwd').name`` is already ``"passwd"`` and
+    ``Path('..hidden').name`` is ``"..hidden"`` — both valid filenames and
+    not part of this regression.
+    """
+
+    store = ArtifactStore(tmp_path)
+
+    ref = store.publish_bytes(
+        b"payload",
+        session_id="session-1",
+        session_key="agent:main:webchat:session-1",
+        name=unsafe_name,
+        mime="text/plain",
+        source="test",
+    )
+
+    assert ref.name == "artifact"
+    # The resolved material path should be a real file, not a directory.
+    resolved_ref, resolved_path = store.resolve_for_download(
+        ref.id, session_id="session-1"
+    )
+    assert resolved_ref == ref
+    assert resolved_path.is_file()
+    assert resolved_path.read_bytes() == b"payload"
