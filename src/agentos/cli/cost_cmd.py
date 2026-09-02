@@ -66,6 +66,10 @@ def cost(
 
     if export_path:
         path = Path(export_path)
+        # Ensure the parent directory exists. Without this, a destination like
+        # `reports/usage.json` (a directory the user has not created yet) dies
+        # with FileNotFoundError on `path.write_text`. See issue #846.
+        path.parent.mkdir(parents=True, exist_ok=True)
         is_csv = csv_output or path.suffix.lower() == ".csv"
         if is_csv:
             import io
