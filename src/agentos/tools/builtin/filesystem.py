@@ -920,17 +920,57 @@ async def list_dir(path: str) -> str:
                 continue
             if _is_sensitive_access_path(entry.resolve(strict=False), workspace=workspace_root):
                 continue
-            if entry.is_dir():
-                dirs.append(f"[dir]  {entry.name}/")
-            else:
-                size = entry.stat().st_size
-                files.append(f"[file] {entry.name} ({size} bytes)")
+            # A single broken symlink in the directory used to crash the
+            # entire listing because ``stat()`` follows the link and the
+            # missing target raises ``FileNotFoundError`` (or ``ELOOP``
+            # for a loop, ``EPERM`` for an unreadable parent, etc).
+            # ``is_dir()`` also follows the link and can raise on some
+            # platforms, so the whole per-entry probe goes through one
+            # ``OSError`` guard with ``lstat()`` as the fallback. We
+            # surface the entry either way — a dangling link is a real
+            # filesystem presence the user should see.
+            try:
+                if entry.is_dir():
+                    dirs.append(f"[dir]  {entry.name}/")
+                    continue
+            except OSError:
+                # ``is_dir()`` raised: treat the entry as a symlink and
+                # fall through to the lstat-based size logic below.
+                pass
+            size = _safe_entry_size(entry)
+            kind = "[link] " if entry.is_symlink() else "[file]"
+            files.append(f"{kind} {entry.name} ({size} bytes)")
         return dirs + files + blocked_entries
 
     entries = await loop.run_in_executor(None, _list)
     if not entries:
         return f"{path}: (empty directory)"
     return "\n".join(entries)
+
+
+def _safe_entry_size(entry: Path) -> int:
+    """Return a size for ``entry`` without crashing on dangling / looped links.
+
+    Order of preference:
+
+    1. ``entry.stat().st_size`` — the target's size for a regular file or a
+       resolved symlink. This is what the original code did.
+    2. ``entry.lstat().st_size`` — the symlink entry's own size. Used when
+       the target is missing (broken link), the link loops on itself
+       (``ELOOP``), or the parent is unreadable (``EPERM``). lstat never
+       follows, so it always succeeds on the symlink entry itself.
+    3. ``0`` — only reached when both calls fail, which in practice means
+       the entry was unlinked between ``iterdir()`` and now.
+    """
+
+    try:
+        return entry.stat().st_size
+    except OSError:
+        pass
+    try:
+        return entry.lstat().st_size
+    except OSError:
+        return 0
 
 
 @tool(

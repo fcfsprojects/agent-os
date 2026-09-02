@@ -393,3 +393,87 @@ async def test_sensitive_path_priority_over_workspace_strict(
     assert dir_result["reason"] == "sensitive_path"
     assert "workspace_strict" not in file_result.get("message", "")
     assert "workspace_strict" not in dir_result.get("message", "")
+
+
+# --- issue #844: list_dir must not crash on broken symlinks -----------------
+
+
+@pytest.mark.asyncio
+async def test_list_dir_broken_symlink_does_not_crash(tmp_path: Path) -> None:
+    """A broken symlink must be listed, not crash the whole tool call."""
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / "valid.txt").write_text("hello", encoding="utf-8")
+    missing_target = workspace / "nonexistent_target.txt"
+    broken_link = workspace / "broken_link.txt"
+    _make_symlink(broken_link, missing_target)
+
+    with tool_context(workspace, strict=False):
+        output = await fs.list_dir(str(workspace))
+
+    assert "[file] valid.txt" in output
+    assert "broken_link.txt" in output
+
+
+@pytest.mark.asyncio
+async def test_list_dir_only_broken_symlinks_returns_empty_marker(
+    tmp_path: Path,
+) -> None:
+    """A directory that contains only broken symlinks must still return cleanly."""
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    for name in ("a_link", "b_link", "c_link"):
+        _make_symlink(workspace / name, workspace / f"missing_{name}")
+
+    with tool_context(workspace, strict=False):
+        output = await fs.list_dir(str(workspace))
+
+    assert "a_link" in output
+    assert "b_link" in output
+    assert "c_link" in output
+    assert "FileNotFoundError" not in output
+    assert "OSError" not in output
+
+
+@pytest.mark.asyncio
+async def test_list_dir_symlink_to_regular_file_still_reports_target_size(
+    tmp_path: Path,
+) -> None:
+    """A symlink that resolves must report the target's size, not the link's size."""
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    target = workspace / "real.txt"
+    target.write_text("abcdefghij", encoding="utf-8")  # 10 bytes
+    _make_symlink(workspace / "link_to_real.txt", target)
+
+    with tool_context(workspace, strict=False):
+        output = await fs.list_dir(str(workspace))
+
+    # link_to_real.txt is reported with the target's size (10), not the
+    # link entry's own size (which is the length of the symlink path).
+    assert "link_to_real.txt" in output
+    assert "(10 bytes)" in output
+
+
+@pytest.mark.asyncio
+async def test_list_dir_direct_strict_blocks_linked_workspace_escape(
+    tmp_path: Path,
+) -> None:
+    """The existing strict-workspace symlink-escape guard must still fire.
+
+    The fix in #844 adds a fallback for *broken* symlinks; it must not
+    change the behaviour for symlinks that resolve successfully but
+    point outside the active read roots.
+    """
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    outside = tmp_path / "outside.txt"
+    outside.write_text("outside\n", encoding="utf-8")
+    link = workspace / "link.txt"
+    _make_symlink(link, outside)
+
+    with tool_context(workspace):
+        output = await fs.list_dir(str(workspace))
+
+    assert "[blocked]" in output
+    assert "outside active read roots" in output
