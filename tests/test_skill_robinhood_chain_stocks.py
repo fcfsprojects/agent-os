@@ -368,3 +368,158 @@ def test_skill_documents_the_read_only_boundary() -> None:
     assert "read-only" in body.lower()
     assert "uiMultiplier()" in body
     assert "4663" in body
+
+
+# --- issue #815 / #816: rpc-url input validation -----------------------------
+
+
+@pytest.mark.parametrize(
+    ("url", "expected_message"),
+    [
+        ("file:///etc/passwd", "file"),
+        ("FILE:///etc/passwd", "file"),
+        ("gopher://rpc.example.com", "gopher"),
+        ("ftp://rpc.example.com", "ftp"),
+        ("javascript:alert(1)", "javascript"),
+        ("", "no scheme"),
+    ],
+)
+def test_http_json_rejects_non_http_schemes(
+    monkeypatch: pytest.MonkeyPatch,
+    url: str,
+    expected_message: str,
+) -> None:
+    """#815: a non-http RPC URL must not reach ``urlopen`` at all.
+
+    ``urllib.request.urlopen`` reads ``file://`` URLs as local files, so passing
+    one through would turn the skill into a local-file read primitive. The
+    scheme guard fires before the request goes out.
+    """
+    raised: dict[str, Any] = {}
+
+    def _explode(*_args: Any, **_kwargs: Any) -> Any:
+        raise AssertionError("urlopen should not be reached for a rejected scheme")
+
+    monkeypatch.setattr(chain_stocks.urllib.request, "urlopen", _explode)
+    try:
+        chain_stocks._http_json(url, timeout=1.0)
+    except chain_stocks.RpcError as exc:
+        raised["error"] = exc
+    assert "error" in raised, f"expected RpcError for {url!r}"
+    assert expected_message in str(raised["error"]).lower()
+
+
+def test_http_json_accepts_http_and_https(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The scheme guard must not block the supported schemes."""
+    body = b'{"jsonrpc":"2.0","id":1,"result":"0x"}'
+
+    class _Resp:
+        def __enter__(self) -> _Resp:
+            return self
+
+        def __exit__(self, *_: Any) -> None:
+            return None
+
+        def read(self) -> bytes:
+            return body
+
+    def _urlopen(_req: Any, timeout: float) -> _Resp:
+        return _Resp()
+
+    monkeypatch.setattr(chain_stocks.urllib.request, "urlopen", _urlopen)
+    assert chain_stocks._http_json("https://rpc.example.com", timeout=1.0) == {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "result": "0x",
+    }
+    assert chain_stocks._http_json("http://rpc.example.com", timeout=1.0) == {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "result": "0x",
+    }
+
+
+def test_validate_rpc_url_scheme_accepts_supported_schemes() -> None:
+    chain_stocks._validate_rpc_url_scheme("https://rpc.example.com")
+    chain_stocks._validate_rpc_url_scheme("HTTP://rpc.example.com")
+    chain_stocks._validate_rpc_url_scheme("http://localhost:8545")
+
+
+def test_validate_rpc_url_scheme_rejects_unsafe_schemes() -> None:
+    for bad in [
+        "file:///etc/passwd",
+        "gopher://rpc",
+        "ftp://rpc",
+        "javascript:void(0)",
+        "data:text/plain,hi",
+        "",
+        "rpc.example.com",
+    ]:
+        with pytest.raises(chain_stocks.RpcError):
+            chain_stocks._validate_rpc_url_scheme(bad)
+
+
+def test_eth_call_handles_string_error_payload(monkeypatch: pytest.MonkeyPatch) -> None:
+    """#816: a bare-string RPC error must surface as ``RpcError``, not crash."""
+
+    def _http_json(_url: str, _timeout: float, _payload: Any) -> Any:
+        return {"jsonrpc": "2.0", "id": 1, "error": "rate limit exceeded"}
+
+    monkeypatch.setattr(chain_stocks, "_http_json", _http_json)
+    with pytest.raises(chain_stocks.RpcError) as excinfo:
+        chain_stocks._eth_call("https://rpc.example.com", AAPL, "0x", 1.0)
+    assert "rate limit exceeded" in str(excinfo.value)
+
+
+def test_eth_call_handles_non_dict_non_string_error_payloads(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#816: any non-dict error payload is normalised to a string, not crashed.
+
+    Public RPC proxies return lists, numbers, ``null`` and other shapes inside
+    ``error``. The previous ``body["error"].get("message", body["error"])`` ran
+    an unconditional ``.get`` and crashed with ``AttributeError`` on each of
+    them; the fix routes every shape through ``str()``.
+    """
+    for payload in [None, 42, ["bad"], {"code": -32000}]:
+        monkeypatch.setattr(
+            chain_stocks,
+            "_http_json",
+            lambda _url, _timeout, _payload, value=payload: {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "error": value,
+            },
+        )
+        with pytest.raises(chain_stocks.RpcError) as excinfo:
+            chain_stocks._eth_call("https://rpc.example.com", AAPL, "0x", 1.0)
+        assert isinstance(str(excinfo.value), str)
+
+
+def test_eth_call_passes_dict_error_through_get_message(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The original ``error.message`` extraction still works for dict errors."""
+
+    def _http_json(_url: str, _timeout: float, _payload: Any) -> Any:
+        return {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "error": {"code": -32000, "message": "execution reverted"},
+        }
+
+    monkeypatch.setattr(chain_stocks, "_http_json", _http_json)
+    with pytest.raises(chain_stocks.RpcError) as excinfo:
+        chain_stocks._eth_call("https://rpc.example.com", AAPL, "0x", 1.0)
+    assert "execution reverted" in str(excinfo.value)
+
+
+def test_extract_rpc_error_message_known_shapes() -> None:
+    assert chain_stocks._extract_rpc_error_message(
+        {"message": "execution reverted"}
+    ) == "execution reverted"
+    assert chain_stocks._extract_rpc_error_message({"code": -32000}) == "{'code': -32000}"
+    assert chain_stocks._extract_rpc_error_message("rate limit") == "rate limit"
+    assert chain_stocks._extract_rpc_error_message(None) == "unknown RPC error"
+    assert chain_stocks._extract_rpc_error_message([1, 2]) == "[1, 2]"
+    assert chain_stocks._extract_rpc_error_message(42) == "42"

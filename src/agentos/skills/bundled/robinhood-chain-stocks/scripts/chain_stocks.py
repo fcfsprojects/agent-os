@@ -26,6 +26,7 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 CHAIN_ID = 4663
 DEFAULT_RPC_URL = "https://rpc.mainnet.chain.robinhood.com"
@@ -56,14 +57,54 @@ class RpcError(RuntimeError):
     """A JSON-RPC call returned an error or an unusable result."""
 
 
+# The #810 skill-supplied RPC URL is reachable from model output, so it cannot
+# be assumed to point at a JSON-RPC endpoint. ``urllib.request.urlopen`` happily
+# reads ``file://`` (turning the script into a local-file reader) and accepts
+# other URI schemes that have nothing to do with EVM RPC. The list below matches
+# the floor ``agentos.tools.ssrf`` applies to outbound HTTP in this repo.
+_RPC_ALLOWED_SCHEMES = frozenset({"http", "https"})
+
+
+def _validate_rpc_url_scheme(url: str) -> None:
+    """Reject ``url`` if it is not an http(s) JSON-RPC endpoint.
+
+    Raises ``RpcError`` (not ``ValueError``) so the caller can surface the
+    failure through ``_try``/``_try_call`` into ``readErrors`` on stdout
+    instead of a traceback.
+    """
+    scheme = (urlparse(url).scheme or "").lower()
+    if scheme not in _RPC_ALLOWED_SCHEMES:
+        raise RpcError(
+            f"rpc-url must use http:// or https:// (got {scheme or 'no scheme'})"
+        )
+
+
 def _http_json(url: str, timeout: float, payload: dict[str, Any] | None = None) -> Any:
+    _validate_rpc_url_scheme(url)
     data = json.dumps(payload).encode("utf-8") if payload is not None else None
     headers = {"User-Agent": "AgentOS-robinhood-chain-stocks/0.1"}
     if data is not None:
         headers["Content-Type"] = "application/json"
-    req = urllib.request.Request(url, data=data, headers=headers)  # noqa: S310 - fixed endpoints
-    with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310
+    req = urllib.request.Request(url, data=data, headers=headers)  # noqa: S310 - scheme guard above
+    with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310 - scheme guard above
         return json.loads(resp.read().decode("utf-8", errors="replace"))
+
+
+def _extract_rpc_error_message(error: Any) -> str:
+    """Coerce an untrusted JSON-RPC ``error`` field into a message string.
+
+    The JSON-RPC spec models errors as objects, but public RPC proxies and load
+    balancers routinely return ``{"error": "rate limit"}`` (bare string) or
+    other non-dict payloads. ``error.get("message", error)`` raises
+    ``AttributeError`` on anything that is not a dict, which used to crash the
+    whole run with a traceback rather than recording the failure under
+    ``readErrors``.
+    """
+    if isinstance(error, dict):
+        return str(error.get("message", error))
+    if error is None:
+        return "unknown RPC error"
+    return str(error)
 
 
 def _eth_call(rpc_url: str, to: str, data: str, timeout: float) -> str:
@@ -79,8 +120,7 @@ def _eth_call(rpc_url: str, to: str, data: str, timeout: float) -> str:
         },
     )
     if isinstance(body, dict) and "error" in body:
-        message = str(body["error"].get("message", body["error"]))
-        raise RpcError(message)
+        raise RpcError(_extract_rpc_error_message(body["error"]))
     result = body.get("result") if isinstance(body, dict) else None
     if not isinstance(result, str) or not result.startswith("0x"):
         raise RpcError("malformed RPC result")
