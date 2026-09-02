@@ -1,5 +1,11 @@
 *.sh text eol=lf
 
+# Frontend checkout must be LF-only so `npm --prefix frontend run check`
+# (which runs prettier --check) succeeds on stock Windows checkouts where
+# core.autocrlf=true would otherwise leave every file in the tree CRLF.
+# Without this, prettier flags every frontend file on every Windows PR.
+frontend/** text eol=lf
+
 # Bundled BGE ONNX export used by memory's local embedder.
 src/agentos/memory/models/bge_onnx/*.onnx filter=lfs diff=lfs merge=lfs -text
 src/agentos/memory/models/bge_onnx/*.json text eol=lf
