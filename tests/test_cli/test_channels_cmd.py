@@ -423,6 +423,45 @@ def test_channels_add_prints_status_verification_next_step(tmp_path, monkeypatch
     out = result.stdout.lower()
     assert "agentos gateway restart" in out
     assert "agentos channels status w --json" in out
+    # Issue #835: the contributor ``uv run`` prefix is not an end-user
+    # command and fails on pipx/pip installs (no ``uv`` on PATH).
+    assert "uv run agentos" not in out
+
+
+# ---------------------------------------------------------------------------
+# issue #835 — sweep: no ``uv run agentos`` in user-facing CLI output
+# ---------------------------------------------------------------------------
+#
+# Andre asked: "grep for other ``uv run agentos`` strings in user-facing
+# CLI output while you are there — if this one leaked in, others may
+# have too." This static guard reads every module under
+# ``src/agentos/cli/`` and fails if any of them still embeds the bare
+# ``uv run agentos`` prefix outside of a code-comment escape hatch. The
+# one-off ``channels add`` test above covers the runtime path; this one
+# covers any sibling that gets added in the future.
+
+
+def test_no_uv_run_agentos_in_user_facing_cli_output() -> None:
+    import re
+    from pathlib import Path
+
+    cli_root = Path("src/agentos/cli")
+    pattern = re.compile(r"uv\s+run\s+agentos")
+    offenders: list[str] = []
+    for path in sorted(cli_root.rglob("*.py")):
+        text = path.read_text()
+        for lineno, line in enumerate(text.splitlines(), start=1):
+            # Skip the docstring block in ``channels_cmd.py`` that
+            # explicitly documents the issue; the guard is about runtime
+            # output, not comments referencing the bug.
+            stripped = line.split("#", 1)[0]
+            if pattern.search(stripped):
+                offenders.append(f"{path}:{lineno}: {line.strip()}")
+    assert not offenders, (
+        "Found ``uv run agentos`` in user-facing CLI source — issue #835 "
+        "requires the bare ``agentos`` form so the printed command works "
+        "on pipx/pip installs (no ``uv`` on PATH):\n  " + "\n  ".join(offenders)
+    )
 
 
 def test_channels_add_echoes_resolved_path_and_source(tmp_path, monkeypatch):

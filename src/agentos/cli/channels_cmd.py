@@ -59,8 +59,15 @@ def _print_restart_notice() -> None:
 
 
 def _print_channel_verification_next_step(name: str) -> None:
+    # Issue #835: ``uv run`` is the contributor inner-loop prefix
+    # (``uv run pytest`` / ``uv run ruff``), not an end-user command.
+    # ``docs/cli.md`` documents ``uv tool``, pipx, and pip as install
+    # methods, and on the latter two there is no ``uv`` on ``PATH``, so
+    # the printed verify command would exit 127 with ``uv: not found``.
+    # Match the adjacent ``Next:`` line and ``docs/troubleshooting.md`` /
+    # ``docs/configuration.md`` by printing the bare ``agentos`` form.
     typer.echo("Next: agentos gateway restart")
-    typer.echo(f"Verify: uv run agentos channels status {name} --json")
+    typer.echo(f"Verify: agentos channels status {name} --json")
 
 
 _SOURCE_LABEL = {
