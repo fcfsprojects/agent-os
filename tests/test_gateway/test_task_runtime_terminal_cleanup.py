@@ -299,3 +299,137 @@ async def test_no_leak_under_load(monkeypatch: pytest.MonkeyPatch) -> None:
     top_stats = snap_after.compare_to(snap_before, "lineno")
     total_added = sum(s.size_diff for s in top_stats if s.size_diff > 0)
     assert total_added < 200 * 1024 * 1024, f"Unexpected memory growth: {total_added / 1024:.1f} KB"
+
+
+# ---------------------------------------------------------------------------
+# issue #930 — envelope cache eviction while peer task still queued
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_envelope_cache_survives_while_peer_task_queued() -> None:
+    """Issue #930: ``_mark_terminal`` must NOT evict the cached envelope for
+    a session while another task for the same session is still pending or
+    running. Without this, a follow-up ``TaskRuntime.send`` during that
+    window loses the channel routing envelope and falls back to a generic
+    ``SourceKind.SYSTEM`` envelope with ``{"kind": "runtime_send"}``
+    provenance, even though the session remains active.
+
+    Acceptance criteria from the issue:
+    - Keep the latest cached route envelope while the session has pending
+      or running work.
+    - ``TaskRuntime.send()`` during that window reuses the cached
+      channel/account/recipient/thread routing.
+    - Remove the cache after the final task for the session reaches a
+      terminal state.
+    """
+
+    first_started = asyncio.Event()
+    first_release = asyncio.Event()
+
+    async def _slow_handler(_run: Any) -> None:
+        first_started.set()
+        await first_release.wait()
+
+    # One slot so the second task stays QUEUED while the first runs.
+    rt = _make_runtime(turn_handler=_slow_handler, max_concurrency=1)
+    env = _make_envelope("agent-1::sess-930")
+    sk = env.session_key
+
+    handle1 = await rt.enqueue(env, "first channel-originated turn")
+    await asyncio.wait_for(first_started.wait(), timeout=2.0)
+    # Second task for the same session — still pending because slot is taken.
+    handle2 = await rt.enqueue(env, "second channel-originated turn")
+
+    # Cache must be populated by the first enqueue.
+    assert sk in rt._last_envelope_by_session
+    assert rt._last_envelope_by_session[sk].source_kind == SourceKind.WEB
+
+    # While the second task is still pending, ``send`` reuses the cached
+    # channel envelope instead of inventing a SYSTEM one.
+    followup = await rt.send(sk, "follow-up while pending")
+    followup_env = rt._tasks[followup.task_id].envelope
+    assert followup_env.source_kind == SourceKind.WEB, (
+        f"send() during queued work must reuse the cached channel envelope, "
+        f"got source_kind={followup_env.source_kind}"
+    )
+    assert followup_env.source_name == "test"
+
+    # Drain: release the first task, wait for all three to finish.
+    first_release.set()
+    await rt.wait(handle1.task_id, timeout=2.0)
+    await rt.wait(handle2.task_id, timeout=2.0)
+    await rt.wait(followup.task_id, timeout=2.0)
+
+    # After the *final* task for the session reaches terminal, the cache
+    # entry must be cleaned up — no leak.
+    assert sk not in rt._last_envelope_by_session
+
+
+@pytest.mark.asyncio
+async def test_send_falls_back_to_system_after_last_task_terminal() -> None:
+    """Companion of the regression above: once the last task for the session
+    has reached terminal, the next ``send`` has nothing to reuse and must
+    fall back to a SYSTEM envelope. This is the existing behavior the fix
+    must NOT regress."""
+
+    async def _instant_handler(_run: Any) -> None:
+        pass
+
+    rt = _make_runtime(turn_handler=_instant_handler, max_concurrency=2)
+    env = _make_envelope("agent-1::sess-930b")
+    sk = env.session_key
+
+    handle = await rt.enqueue(env, "only turn")
+    await rt.wait(handle.task_id, timeout=2.0)
+    assert sk not in rt._last_envelope_by_session
+
+    followup = await rt.send(sk, "follow-up after drain")
+    followup_env = rt._tasks[followup.task_id].envelope
+    assert followup_env.source_kind == SourceKind.SYSTEM
+    assert followup_env.input_provenance == {"kind": "runtime_send"}
+    await rt.wait(followup.task_id, timeout=2.0)
+
+
+@pytest.mark.asyncio
+async def test_send_with_provenance_override_does_not_pollute_cache() -> None:
+    """Acceptance criterion: ``TaskRuntime.send(provenance=...)`` is a
+    one-shot override. The caller-supplied provenance must NOT be written
+    back to the cache, so subsequent ``send(provenance=None)`` calls keep
+    reusing the original cached envelope (not the override).
+    """
+
+    first_started = asyncio.Event()
+    first_release = asyncio.Event()
+
+    async def _slow_handler(_run: Any) -> None:
+        first_started.set()
+        await first_release.wait()
+
+    rt = _make_runtime(turn_handler=_slow_handler, max_concurrency=1)
+    env = _make_envelope("agent-1::sess-930c")
+    sk = env.session_key
+
+    handle1 = await rt.enqueue(env, "first")
+    await asyncio.wait_for(first_started.wait(), timeout=2.0)
+
+    override_provenance = {"kind": "caller_override"}
+    overridden = await rt.send(sk, "one-shot override", provenance=override_provenance)
+    overridden_env = rt._tasks[overridden.task_id].envelope
+    assert overridden_env.input_provenance == override_provenance
+    # But the cache must still hold the original channel provenance.
+    cached = rt._last_envelope_by_session[sk]
+    assert cached.input_provenance == {"kind": "test"}
+
+    # A subsequent send(provenance=None) reuses the cached envelope, not
+    # the override that was just applied to a separate envelope.
+    bare = await rt.send(sk, "back to cached")
+    bare_env = rt._tasks[bare.task_id].envelope
+    assert bare_env.source_kind == SourceKind.WEB
+    assert bare_env.input_provenance == {"kind": "test"}
+
+    first_release.set()
+    await rt.wait(handle1.task_id, timeout=2.0)
+    await rt.wait(overridden.task_id, timeout=2.0)
+    await rt.wait(bare.task_id, timeout=2.0)
+    assert sk not in rt._last_envelope_by_session
