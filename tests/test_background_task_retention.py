@@ -314,8 +314,8 @@ class TestWsConnectionRetention(unittest.TestCase):
         # WsConnection has many required fields. We instantiate with the
         # minimum needed for the tracker to exist (the tracker is a default
         # factory field, init=False, so it materializes at construction).
+
         from agentos.gateway.websocket import WsConnection
-        from starlette.websockets import WebSocket
 
         # Use a dummy websocket-like object via ``object()`` is unsafe because
         # the dataclass uses ``WebSocket`` directly. The dataclass type

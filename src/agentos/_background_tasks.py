@@ -24,7 +24,8 @@ the loop's ``call_soon`` queue.
 from __future__ import annotations
 
 import asyncio
-from typing import Any, Coroutine
+from collections.abc import Coroutine
+from typing import Any
 
 
 class BackgroundTaskTracker:
@@ -142,7 +143,7 @@ class BackgroundTaskTracker:
                 ),
                 timeout=timeout,
             )
-        except asyncio.TimeoutError:
+        except TimeoutError:
             # Leave the un-cancelled tasks in the tracker. They are
             # cancelled but may still be running their cleanup; the caller
             # can choose to escalate or accept the leak.

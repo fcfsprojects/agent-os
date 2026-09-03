@@ -28,6 +28,7 @@ from typing import Any, Final, Literal, SupportsInt, TypeGuard, cast
 
 import structlog
 
+from agentos._background_tasks import BackgroundTaskTracker
 from agentos.artifacts import artifact_marker
 from agentos.attachment_refs import (
     is_attachment_ref,
@@ -47,7 +48,6 @@ from agentos.contracts.attachments import (
 from agentos.contracts.attachments import (
     attachment_size_limit_for_mime as _attachment_size_limit_for_mime,
 )
-from agentos._background_tasks import BackgroundTaskTracker
 from agentos.engine.agent import Agent, ToolHandler
 from agentos.engine.cache_break_monitor import notify_compaction
 from agentos.engine.hooks import (
